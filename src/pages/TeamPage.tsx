@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/context/AuthContext'
 import { useTask } from '@/context/TaskContext'
 import { Copy, Users, Plus, Link2, Crown, UserCheck } from 'lucide-react'
@@ -7,6 +8,7 @@ import toast from 'react-hot-toast'
 export default function TeamPage() {
   const { user } = useAuth()
   const { teams, createTeam, joinTeam, loading } = useTask()
+  const navigate = useNavigate()
 
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showJoinModal, setShowJoinModal] = useState(false)
@@ -21,11 +23,15 @@ export default function TeamPage() {
     if (!teamName.trim()) return
 
     setCreating(true)
-    await createTeam(teamName.trim(), teamDesc.trim())
+    const createdTeam = await createTeam(teamName.trim(), teamDesc.trim())
     setTeamName('')
     setTeamDesc('')
     setShowCreateModal(false)
     setCreating(false)
+
+    if (createdTeam) {
+      navigate('/')
+    }
   }
 
   const handleJoinTeam = async (e: React.FormEvent) => {

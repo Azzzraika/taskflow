@@ -43,7 +43,10 @@ export default function DashboardPage() {
   const [modalStatus, setModalStatus] = useState<TaskStatus>('todo')
   const [searchQuery, setSearchQuery] = useState('')
   const [filterPriority, setFilterPriority] = useState<string>('all')
-  const [activeTeam, setActiveTeam] = useState<string>('')
+  const [activeTeam, setActiveTeam] = useState<string>(() => {
+    if (typeof window === 'undefined') return ''
+    return localStorage.getItem('taskflow-active-team-id') || ''
+  })
   const [activeDragTask, setActiveDragTask] = useState<Task | null>(null)
   const [localTasks, setLocalTasks] = useState<Task[]>([])
 
@@ -52,16 +55,33 @@ export default function DashboardPage() {
     setLocalTasks(tasks)
   }, [tasks])
 
-  // Auto-select first team
+  // Select the saved team or fall back to the first available one
   useEffect(() => {
-    if (teams.length > 0 && !activeTeam) {
+    if (teams.length === 0) {
+      setActiveTeam('')
+      return
+    }
+
+    const savedTeamId = typeof window !== 'undefined'
+      ? localStorage.getItem('taskflow-active-team-id')
+      : null
+
+    if (savedTeamId && teams.some((team) => team.id === savedTeamId)) {
+      if (activeTeam !== savedTeamId) {
+        setActiveTeam(savedTeamId)
+      }
+      return
+    }
+
+    if (!activeTeam || !teams.some((team) => team.id === activeTeam)) {
       setActiveTeam(teams[0].id)
     }
   }, [teams, activeTeam])
 
-  // Load tasks when team changes
+  // Persist selected team and load tasks when it changes
   useEffect(() => {
     if (activeTeam) {
+      localStorage.setItem('taskflow-active-team-id', activeTeam)
       refreshTasks(activeTeam)
     }
   }, [activeTeam])

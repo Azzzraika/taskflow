@@ -205,6 +205,9 @@ export function TaskProvider({ children }: { children: ReactNode }) {
     try {
       const team = await createTeamApi(name, description)
       await refreshTeams()
+      if (team) {
+        localStorage.setItem('taskflow-active-team-id', team.id)
+      }
       toast.success('Команда құрылды!')
       return team as TeamWithMembers
     } catch (err) {
