@@ -114,6 +114,17 @@ export async function createTeam(name: string, description: string): Promise<Tea
     .single()
 
   if (error) throw error
+
+  const { error: memberError } = await supabase
+    .from('team_members')
+    .insert({
+      team_id: data.id,
+      user_id: user.id,
+      role: 'owner'
+    })
+
+  if (memberError) throw memberError
+
   return data as Team
 }
 
