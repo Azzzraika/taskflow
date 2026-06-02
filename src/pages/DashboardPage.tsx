@@ -1,88 +1,235 @@
-import { useState, useMemo } from 'react'
-import { useTaskContext } from '@/context/TaskContext'
-import { DndContext, DragEndEvent } from '@dnd-kit/core'
-import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
-import TaskCard from '@/components/TaskCard'
+import { useState, useMemo, useEffect, useCallback } from 'react'
+import {
+  DndContext,
+  closestCorners,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent,
+  DragOverlay,
+} from '@dnd-kit/core'
+import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
+import type { Task, TaskStatus } from '@/types'
+import { useAuth } from '@/context/AuthContext'
+import { useTask } from '@/context/TaskContext'
+import TaskColumn from '@/components/TaskColumn'
 import TaskModal from '@/components/TaskModal'
-import { Plus, Search, Filter, Loader2 } from 'lucide-react'
+import TaskCard from '@/components/TaskCard'
+import { Plus, Filter, Search } from 'lucide-react'
 
-const COLUMNS = [
-  { id: 'todo', title: 'Күтуде', color: 'bg-gray-50 border-gray-200' },
-  { id: 'in_progress', title: 'Орындалуда', color: 'bg-blue-50 border-blue-200' },
-  { id: 'done', title: 'Дайын', color: 'bg-green-50 border-green-200' },
+const columns: { status: TaskStatus; title: string; color: string }[] = [
+  { status: 'todo', title: 'Күтуде', color: 'bg-gray-400' },
+  { status: 'in_progress', title: 'Орындалуда', color: 'bg-blue-500' },
+  { status: 'done', title: 'Дайын', color: 'bg-green-500' },
 ]
 
 export default function DashboardPage() {
+  const { user } = useAuth()
   const { 
     tasks, 
     teams, 
-    selectedTeamId, 
-    loading, 
-    setSelectedTeamId, 
-    updateTask,
-    createTask 
-  } = useTaskContext()
-  
-  const [search, setSearch] = useState('')
-  const [filterPriority, setFilterPriority] = useState<string>('all')
+    activeTeamId, 
+    setActiveTeamId, 
+    updateTaskStatus, 
+    createTask, 
+    editTask, 
+    removeTask,
+    loading: tasksLoading 
+  } = useTask()
+
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingTask, setEditingTask] = useState<Task | null>(null)
-  const [modalStatus, setModalStatus] = useState<string>('todo')
+  const [modalStatus, setModalStatus] = useState('todo')
+  const [searchQuery, setSearchQuery] = useState('')
+  const [filterPriority, setFilterPriority] = useState('all')
+  const [activeDragTask, setActiveDragTask] = useState<Task | null>(null)
+  const [localTasks, setLocalTasks] = useState<Task[]>([])
 
-  // Ключ для принудительного ре-mount при смене команды
-  const boardKey = selectedTeamId || 'no-team'
+  // Sync with context tasks
+  useEffect(() => {
+    setLocalTasks(tasks)
+  }, [tasks])
+
+  // Initialize active team from localStorage or first team
+  useEffect(() => {
+    if (teams.length === 0) {
+      setActiveTeamId(null)
+      return
+    }
+
+    const savedTeamId = typeof window !== 'undefined'
+      ? localStorage.getItem('taskflow-active-team-id')
+      : null
+
+    if (savedTeamId && teams.some((team) => team.id === savedTeamId)) {
+      // Only set if different from current
+      if (activeTeamId !== savedTeamId) {
+        setActiveTeamId(savedTeamId)
+      }
+      return
+    }
+
+    if (!activeTeamId || !teams.some((team) => team.id === activeTeamId)) {
+      setActiveTeamId(teams[0].id)
+    }
+  }, [teams]) // ← Убран activeTeamId из зависимостей!
+
+  // Persist selected team to localStorage
+  useEffect(() => {
+    if (activeTeamId) {
+      localStorage.setItem('taskflow-active-team-id', activeTeamId)
+    }
+  }, [activeTeamId])
 
   const filteredTasks = useMemo(() => {
-    return tasks.filter(task => {
-      const matchesSearch = task.title.toLowerCase().includes(search.toLowerCase()) ||
-        task.description?.toLowerCase().includes(search.toLowerCase())
-      const matchesPriority = filterPriority === 'all' || task.priority === filterPriority
-      return matchesSearch && matchesPriority
+    let result = [...localTasks]
+
+    if (searchQuery) {
+      result = result.filter(
+        (t) =>
+          t.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+          (t.description && t.description.toLowerCase().includes(searchQuery.toLowerCase()))
+      )
+    }
+
+    if (filterPriority !== 'all') {
+      result = result.filter((t) => t.priority === filterPriority)
+    }
+
+    return result
+  }, [localTasks, searchQuery, filterPriority])
+
+  const tasksByStatus = useMemo(() => {
+    return {
+      todo: filteredTasks.filter((t) => t.status === 'todo'),
+      in_progress: filteredTasks.filter((t) => t.status === 'in_progress'),
+      done: filteredTasks.filter((t) => t.status === 'done'),
+    }
+  }, [filteredTasks])
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
     })
-  }, [tasks, search, filterPriority])
+  )
 
-  const tasksByStatus = useMemo(() => ({
-    todo: filteredTasks.filter(t => t.status === 'todo'),
-    in_progress: filteredTasks.filter(t => t.status === 'in_progress'),
-    done: filteredTasks.filter(t => t.status === 'done'),
-  }), [filteredTasks])
-
-  const handleDragEnd = async (event: DragEndEvent) => {
+  const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event
+    setActiveDragTask(null)
+
     if (!over) return
 
     const taskId = active.id as string
-    const newStatus = over.id as string
-    
-    if (['todo', 'in_progress', 'done'].includes(newStatus)) {
-      await updateTask(taskId, { status: newStatus })
+    const overId = over.id as string
+
+    const columnStatus = columns.find((c) => c.status === overId)?.status
+    if (columnStatus) {
+      setLocalTasks((prev) =>
+        prev.map((t) => (t.id === taskId ? { ...t, status: columnStatus } : t))
+      )
+      updateTaskStatus(taskId, columnStatus)
+      return
+    }
+
+    const overTask = localTasks.find((t) => t.id === overId)
+    if (overTask && overTask.id !== taskId) {
+      const draggedTask = localTasks.find((t) => t.id === taskId)
+      if (draggedTask && overTask.status !== draggedTask.status) {
+        setLocalTasks((prev) =>
+          prev.map((t) => (t.id === taskId ? { ...t, status: overTask.status } : t))
+        )
+        updateTaskStatus(taskId, overTask.status)
+      }
     }
   }
 
-  const openCreateModal = (status: string) => {
+  const handleDragStart = (event: DragStartEvent) => {
+    const taskId = String(event.active.id)
+    const task = localTasks.find((t) => t.id === taskId)
+    if (task) setActiveDragTask(task)
+  }
+
+  const handleAddTask = (status: TaskStatus) => {
     setEditingTask(null)
     setModalStatus(status)
     setIsModalOpen(true)
   }
 
+  const handleEditTask = (task: Task) => {
+    setEditingTask(task)
+    setModalStatus(task.status)
+    setIsModalOpen(true)
+  }
+
+  const handleSubmit = async (taskData: Partial<Task>) => {
+    if (editingTask) {
+      await editTask({ ...editingTask, ...taskData } as Task)
+    } else {
+      await createTask({
+        title: taskData.title!,
+        description: taskData.description || '',
+        status: (taskData.status as TaskStatus) || modalStatus,
+        priority: taskData.priority || 'medium',
+        assignee_id: user?.id || null,
+        team_id: activeTeamId || '',
+        deadline: taskData.deadline || null,
+        created_by: user?.id || '',
+      })
+    }
+  }
+
+  // Handle team change from select
+  const handleTeamChange = useCallback((teamId: string) => {
+    setActiveTeamId(teamId)
+  }, [setActiveTeamId])
+
+  if (teams.length === 0 && !tasksLoading) {
+    return (
+      <div className="text-center py-20">
+        <div className="w-20 h-20 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-6">
+          <Plus className="w-10 h-10 text-gray-400" />
+        </div>
+        <h2 className="text-2xl font-bold text-gray-900 mb-2">
+          Командалар жоқ
+        </h2>
+        <p className="text-gray-600 mb-6">
+          Тапсырмаларды басқару үшін алдымен команда құрыңыз немесе қосылыңыз
+        </p>
+        <a href="/team" className="btn-primary inline-flex items-center gap-2">
+          <Plus className="w-5 h-5" />
+          Команда құру
+        </a>
+      </div>
+    )
+  }
+
   return (
-    <div className="p-6 max-w-7xl mx-auto">
+    <div>
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-8">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Тапсырмалар тақтасы</h1>
-          <p className="text-gray-500 mt-1">Тапсырмаларды сүйреп, мәртебесін өзгертіңіз</p>
+          <p className="text-gray-600 mt-1">
+            Тапсырмаларды сүйреп, мәртебесін өзгертіңіз
+          </p>
         </div>
-        
-        <div className="flex items-center gap-3 flex-wrap">
+
+        <div className="flex flex-wrap items-center gap-3">
           {/* Team Selector */}
           <select
-            value={selectedTeamId || ''}
-            onChange={(e) => setSelectedTeamId(e.target.value || null)}
-            className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 outline-none bg-white"
+            value={activeTeamId || ''}
+            onChange={(e) => handleTeamChange(e.target.value)}
+            className="input-field w-auto"
           >
-            {teams.map(team => (
-              <option key={team.id} value={team.id}>{team.name}</option>
+            {teams.map((team) => (
+              <option key={team.id} value={team.id}>
+                {team.name}
+              </option>
             ))}
           </select>
 
@@ -91,127 +238,109 @@ export default function DashboardPage() {
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
             <input
               type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Іздеу..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 outline-none w-48"
+              className="input-field pl-9 w-48"
             />
           </div>
 
           {/* Priority Filter */}
-          <select
-            value={filterPriority}
-            onChange={(e) => setFilterPriority(e.target.value)}
-            className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 outline-none bg-white"
-          >
-            <option value="all">Барлық приоритет</option>
-            <option value="high">Жоғары</option>
-            <option value="medium">Орташа</option>
-            <option value="low">Төмен</option>
-          </select>
+          <div className="relative">
+            <Filter className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <select
+              value={filterPriority}
+              onChange={(e) => setFilterPriority(e.target.value)}
+              className="input-field pl-9 w-40"
+            >
+              <option value="all">Барлық приоритет</option>
+              <option value="high">Жоғары</option>
+              <option value="medium">Орташа</option>
+              <option value="low">Төмен</option>
+            </select>
+          </div>
 
           <button
-            onClick={() => openCreateModal('todo')}
+            onClick={() => handleAddTask('todo')}
             className="btn-primary flex items-center gap-2"
           >
-            <Plus className="w-4 h-4" />
+            <Plus className="w-5 h-5" />
             Жаңа тапсырма
           </button>
         </div>
       </div>
 
       {/* Stats */}
-      <div className="grid grid-cols-3 gap-4 mb-6">
-        {COLUMNS.map(col => (
-          <div key={col.id} className={`card ${col.color}`}>
+      <div className="grid grid-cols-3 gap-4 mb-8">
+        {columns.map((col) => (
+          <div key={col.status} className="card py-4">
             <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${
-                col.id === 'todo' ? 'bg-gray-400' : 
-                col.id === 'in_progress' ? 'bg-blue-500' : 'bg-green-500'
-              }`} />
-              <span className="text-sm font-medium text-gray-600">{col.title}</span>
+              <div className={`w-2 h-2 rounded-full ${col.color}`} />
+              <span className="text-sm text-gray-600">{col.title}</span>
             </div>
-            <p className="text-2xl font-bold mt-2">
-              {loading ? '-' : tasksByStatus[col.id as keyof typeof tasksByStatus].length}
+            <p className="text-2xl font-bold text-gray-900 mt-1">
+              {tasksLoading ? '-' : tasksByStatus[col.status].length}
             </p>
           </div>
         ))}
       </div>
 
-      {/* Board — key принудительно пересоздаёт при смене команды */}
-      <DndContext onDragEnd={handleDragEnd} key={boardKey}>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          {COLUMNS.map(column => (
-            <div 
-              key={column.id} 
-              className={`card ${column.color} min-h-[400px]`}
-            >
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full ${
-                    column.id === 'todo' ? 'bg-gray-400' : 
-                    column.id === 'in_progress' ? 'bg-blue-500' : 'bg-green-500'
-                  }`} />
-                  <h3 className="font-semibold">{column.title}</h3>
-                  <span className="text-sm text-gray-500 bg-white px-2 py-0.5 rounded-full">
-                    {loading ? '...' : tasksByStatus[column.id as keyof typeof tasksByStatus].length}
-                  </span>
-                </div>
-                <button 
-                  onClick={() => openCreateModal(column.id)}
-                  className="text-gray-400 hover:text-primary-600 transition-colors"
-                >
-                  <Plus className="w-5 h-5" />
-                </button>
-              </div>
-
-              {/* Loading State */}
-              {loading ? (
-                <div className="flex flex-col items-center justify-center py-12 text-gray-400">
-                  <Loader2 className="w-8 h-8 animate-spin mb-2" />
-                  <span className="text-sm">Жүктелуде...</span>
-                </div>
-              ) : tasksByStatus[column.id as keyof typeof tasksByStatus].length === 0 ? (
-                <div className="text-center py-12 text-gray-400">
-                  <p>Тапсырма жоқ</p>
-                </div>
-              ) : (
-                <SortableContext 
-                  items={tasksByStatus[column.id as keyof typeof tasksByStatus].map(t => t.id)}
-                  strategy={verticalListSortingStrategy}
-                >
-                  <div className="space-y-3">
-                    {tasksByStatus[column.id as keyof typeof tasksByStatus].map(task => (
-                      <TaskCard 
-                        key={task.id} 
-                        task={task}
-                        onEdit={() => {
-                          setEditingTask(task)
-                          setModalStatus(task.status)
-                          setIsModalOpen(true)
-                        }}
-                      />
-                    ))}
-                  </div>
-                </SortableContext>
-              )}
-            </div>
-          ))}
+      {/* Loading */}
+      {tasksLoading && (
+        <div className="flex items-center justify-center py-12">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600" />
         </div>
-      </DndContext>
-
-      {isModalOpen && (
-        <TaskModal
-          isOpen={isModalOpen}
-          onClose={() => {
-            setIsModalOpen(false)
-            setEditingTask(null)
-          }}
-          task={editingTask}
-          status={modalStatus}
-          teamId={selectedTeamId!}
-        />
       )}
+
+      {/* Kanban Board */}
+      {!tasksLoading && (
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCorners}
+          onDragStart={handleDragStart}
+          onDragEnd={handleDragEnd}
+          key={activeTeamId || 'no-team'} // ← key для полного re-mount при смене команды
+        >
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {columns.map((col) => (
+              <TaskColumn
+                key={col.status}
+                status={col.status}
+                title={col.title}
+                tasks={tasksByStatus[col.status]}
+                color={col.color}
+                onEdit={handleEditTask}
+                onDelete={removeTask}
+                onAdd={() => handleAddTask(col.status)}
+              />
+            ))}
+          </div>
+
+          <DragOverlay>
+            {activeDragTask ? (
+              <div className="opacity-90 rotate-2">
+                <TaskCard
+                  task={activeDragTask}
+                  onEdit={() => {}}
+                  onDelete={() => {}}
+                />
+              </div>
+            ) : null}
+          </DragOverlay>
+        </DndContext>
+      )}
+
+      <TaskModal
+        isOpen={isModalOpen}
+        onClose={() => {
+          setIsModalOpen(false)
+          setEditingTask(null)
+        }}
+        onSubmit={handleSubmit}
+        task={editingTask}
+        teamId={activeTeamId || ''}
+        defaultStatus={modalStatus as TaskStatus}
+      />
     </div>
   )
 }
