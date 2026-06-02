@@ -1,255 +1,350 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react'
-import { supabase } from '@/services/supabase'
-import type { Task, Team, Notification } from '@/types'
+import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from 'react'
+import type { Task, TaskStatus, TeamWithMembers, Notification } from '@/types'
+import { useAuth } from './AuthContext'
+import {
+  getUserTeams,
+  getTasks,
+  createTask as createTaskApi,
+  updateTask as updateTaskApi,
+  deleteTask as deleteTaskApi,
+  joinTeamByCode,
+  createTeam as createTeamApi,
+  getNotifications,
+  markNotificationAsRead,
+  createNotification,
+  subscribeToTasks,
+  subscribeToNotifications,
+  removeChannel,
+} from '@/services/supabase'
+import toast from 'react-hot-toast'
 
 interface TaskContextType {
   tasks: Task[]
-  teams: Team[]
+  teams: TeamWithMembers[]
   notifications: Notification[]
-  selectedTeamId: string | null
-  loading: boolean
-  setSelectedTeamId: (id: string | null) => void
-  createTask: (task: Omit<Task, 'id' | 'created_at'>) => Promise<void>
-  updateTask: (id: string, updates: Partial<Task>) => Promise<void>
-  deleteTask: (id: string) => Promise<void>
+  activeTeamId: string | null
+  setActiveTeamId: (id: string | null) => void
+  createTask: (task: Omit<Task, 'id' | 'created_at' | 'updated_at'>) => Promise<void>
+  updateTaskStatus: (id: string, status: TaskStatus) => Promise<void>
+  editTask: (task: Task) => Promise<void>
+  removeTask: (id: string) => Promise<void>
+  createTeam: (name: string, description: string) => Promise<TeamWithMembers | null>
+  joinTeam: (inviteCode: string) => Promise<boolean>
+  getTeamTasks: (teamId: string) => Task[]
+  getUserTeamsList: () => TeamWithMembers[]
+  unreadCount: number
+  markNotifRead: (id: string) => Promise<void>
   refreshTasks: () => Promise<void>
-  createTeam: (name: string, description: string) => Promise<void>
-  joinTeam: (inviteCode: string) => Promise<void>
-  markNotificationRead: (id: string) => Promise<void>
+  refreshTeams: () => Promise<void>
+  refreshNotifications: () => Promise<void>
+  loading: boolean
 }
 
 const TaskContext = createContext<TaskContextType | undefined>(undefined)
 
-export function TaskProvider({ children }: { children: React.ReactNode }) {
+export function TaskProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth()
   const [tasks, setTasks] = useState<Task[]>([])
-  const [teams, setTeams] = useState<Team[]>([])
+  const [teams, setTeams] = useState<TeamWithMembers[]>([])
   const [notifications, setNotifications] = useState<Notification[]>([])
-  const [selectedTeamId, setSelectedTeamIdState] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  const [activeTeamId, setActiveTeamIdState] = useState<string | null>(null)
   
-  // Ref для отслеживания текущей загрузки и предотвращения гонки
-  const loadingRef = useRef(false)
+  // Ref для отслеживания загруженной команды и предотвращения цикла
   const lastLoadedTeamRef = useRef<string | null>(null)
+  const isLoadingRef = useRef(false)
 
-  // Загрузка команд пользователя
+  // Load teams on mount
   useEffect(() => {
-    const loadTeams = async () => {
-      const { data: userData } = await supabase.auth.getUser()
-      if (!userData.user) return
-
-      const { data: memberships } = await supabase
-        .from('team_members')
-        .select('team_id')
-        .eq('user_id', userData.user.id)
-
-      if (!memberships?.length) {
-        setTeams([])
-        return
-      }
-
-      const teamIds = memberships.map(m => m.team_id)
-      const { data: teamsData } = await supabase
-        .from('teams')
-        .select('*')
-        .in('id', teamIds)
-
-      setTeams(teamsData || [])
-      
-      // Выбираем первую команду по умолчанию ТОЛЬКО если ничего не выбрано
-      if (!selectedTeamId && teamsData?.length) {
-        setSelectedTeamIdState(teamsData[0].id)
-      }
+    if (user) {
+      refreshTeams()
+      refreshNotifications()
     }
+  }, [user])
 
-    loadTeams()
-  }, []) // ← Пустые зависимости! Загружаем команды только при монтировании
-
-  // Загрузка задач при смене команды
+  // Загрузка задач при смене activeTeamId — ТОЛЬКО если команда реально изменилась
   useEffect(() => {
-    if (!selectedTeamId) {
+    if (!activeTeamId || !user) {
       setTasks([])
+      lastLoadedTeamRef.current = null
       return
     }
 
-    // Предотвращаем повторную загрузку той же команды
-    if (lastLoadedTeamRef.current === selectedTeamId && !loadingRef.current) {
+    // Главная защита: не грузим, если уже грузим эту же команду
+    if (lastLoadedTeamRef.current === activeTeamId || isLoadingRef.current) {
       return
     }
 
     const loadTasks = async () => {
-      // Защита от параллельных запросов
-      if (loadingRef.current) return
-      
-      loadingRef.current = true
-      lastLoadedTeamRef.current = selectedTeamId
+      isLoadingRef.current = true
+      lastLoadedTeamRef.current = activeTeamId
       setLoading(true)
-      setTasks([]) // ← ОЧИЩАЕМ старые задачи сразу!
+      setTasks([]) // Очищаем старые задачи сразу
 
       try {
-        const { data, error } = await supabase
-          .from('tasks')
-          .select('*')
-          .eq('team_id', selectedTeamId)
-          .order('created_at', { ascending: false })
-
-        if (error) {
-          console.error('Error fetching tasks:', error)
-          setTasks([])
-        } else {
-          setTasks(data || [])
+        const data = await getTasks(activeTeamId)
+        // Проверяем, что команда не сменилась пока мы грузили
+        if (lastLoadedTeamRef.current === activeTeamId) {
+          setTasks(data)
         }
+      } catch (err) {
+        console.error('Error loading tasks:', err)
       } finally {
         setLoading(false)
-        loadingRef.current = false
+        isLoadingRef.current = false
       }
     }
 
     loadTasks()
-  }, [selectedTeamId]) // ← Только selectedTeamId! НЕ tasks!
+  }, [activeTeamId, user])
 
-  // Real-time подписка
+  // Real-time подписка — обновляем локально, НЕ вызывая refreshTasks
   useEffect(() => {
-    if (!selectedTeamId) return
+    if (!activeTeamId || !user) return
 
-    const subscription = supabase
-      .channel(`tasks:${selectedTeamId}`)
-      .on('postgres_changes', 
-        { event: '*', schema: 'public', table: 'tasks', filter: `team_id=eq.${selectedTeamId}` },
-        (payload) => {
-          // Обновляем задачи локально, НЕ вызывая полную перезагрузку
-          if (payload.eventType === 'INSERT') {
-            setTasks(prev => [payload.new as Task, ...prev])
-          } else if (payload.eventType === 'UPDATE') {
-            setTasks(prev => prev.map(t => t.id === payload.new.id ? payload.new as Task : t))
-          } else if (payload.eventType === 'DELETE') {
-            setTasks(prev => prev.filter(t => t.id !== payload.old.id))
-          }
+    const taskChannel = subscribeToTasks(activeTeamId, (payload) => {
+      console.log('Task change:', payload)
+      
+      // Локальное обновление вместо полной перезагрузки
+      setTasks((prev) => {
+        if (payload.eventType === 'INSERT') {
+          return [payload.new as Task, ...prev]
+        } else if (payload.eventType === 'UPDATE') {
+          return prev.map((t) => (t.id === payload.new.id ? payload.new as Task : t))
+        } else if (payload.eventType === 'DELETE') {
+          return prev.filter((t) => t.id !== payload.old.id)
         }
-      )
-      .subscribe()
+        return prev
+      })
+    })
 
     return () => {
-      subscription.unsubscribe()
+      removeChannel(taskChannel)
     }
-  }, [selectedTeamId])
+  }, [activeTeamId, user])
 
-  const setSelectedTeamId = useCallback((id: string | null) => {
-    if (id !== selectedTeamId) {
-      setTasks([]) // ← Очистка при ручной смене
-      setSelectedTeamIdState(id)
-    }
-  }, [selectedTeamId])
+  // Notifications subscription
+  useEffect(() => {
+    if (!user) return
 
-  const refreshTasks = useCallback(async () => {
-    if (!selectedTeamId || loadingRef.current) return
-    
-    loadingRef.current = true
-    setLoading(true)
-    
-    try {
-      const { data, error } = await supabase
-        .from('tasks')
-        .select('*')
-        .eq('team_id', selectedTeamId)
-        .order('created_at', { ascending: false })
-
-      if (!error) {
-        setTasks(data || [])
+    const notifChannel = subscribeToNotifications(user.id, (payload) => {
+      console.log('New notification:', payload)
+      refreshNotifications()
+      if (payload.new) {
+        toast(payload.new.message, { icon: '🔔' })
       }
+    })
+
+    return () => {
+      removeChannel(notifChannel)
+    }
+  }, [user])
+
+  // Check deadlines periodically
+  useEffect(() => {
+    if (!user) return
+    const interval = setInterval(() => {
+      checkDeadlines()
+    }, 60000)
+
+    return () => clearInterval(interval)
+  }, [user, tasks])
+
+  const checkDeadlines = async () => {
+    const now = new Date()
+    const upcomingTasks = tasks.filter(
+      (t) => t.assignee_id === user?.id && t.status !== 'done' && t.deadline
+    )
+
+    for (const task of upcomingTasks) {
+      const deadline = new Date(task.deadline!)
+      const diff = deadline.getTime() - now.getTime()
+      const hoursLeft = diff / (1000 * 60 * 60)
+
+      if (hoursLeft > 0 && hoursLeft < 24) {
+        const existing = notifications.find(
+          (n) => n.type === 'deadline' && n.message.includes(task.title)
+        )
+        if (!existing) {
+          try {
+            await createNotification({
+              user_id: user!.id,
+              type: 'deadline',
+              message: `Дедлайн жақындады: "${task.title}"`,
+              read: false,
+            })
+            refreshNotifications()
+          } catch (err) {
+            console.error('Failed to create notification:', err)
+          }
+        }
+      }
+    }
+  }
+
+  // setActiveTeamId — публичный setter
+  const setActiveTeamId = useCallback((id: string | null) => {
+    if (id !== activeTeamId) {
+      setTasks([]) // Очищаем сразу
+      lastLoadedTeamRef.current = null // Сбрасываем ref
+      setActiveTeamIdState(id)
+    }
+  }, [activeTeamId])
+
+  // refreshTasks — перезагрузка для текущей команды (без смены activeTeamId!)
+  const refreshTasks = useCallback(async () => {
+    if (!activeTeamId || isLoadingRef.current) return
+
+    isLoadingRef.current = true
+    lastLoadedTeamRef.current = activeTeamId
+    setLoading(true)
+
+    try {
+      const data = await getTasks(activeTeamId)
+      if (lastLoadedTeamRef.current === activeTeamId) {
+        setTasks(data)
+      }
+    } catch (err) {
+      console.error('Error refreshing tasks:', err)
     } finally {
       setLoading(false)
-      loadingRef.current = false
+      isLoadingRef.current = false
     }
-  }, [selectedTeamId])
+  }, [activeTeamId])
 
-  const createTask = useCallback(async (task: Omit<Task, 'id' | 'created_at'>) => {
-    const { error } = await supabase.from('tasks').insert(task)
-    if (error) throw error
-    // Real-time обновит список автоматически
-  }, [])
+  const refreshTeams = async () => {
+    setLoading(true)
+    const data = await getUserTeams()
+    setTeams(data)
+    setLoading(false)
+  }
 
-  const updateTask = useCallback(async (id: string, updates: Partial<Task>) => {
-    const { error } = await supabase.from('tasks').update(updates).eq('id', id)
-    if (error) throw error
-  }, [])
+  const refreshNotifications = async () => {
+    const data = await getNotifications()
+    setNotifications(data)
+  }
 
-  const deleteTask = useCallback(async (id: string) => {
-    const { error } = await supabase.from('tasks').delete().eq('id', id)
-    if (error) throw error
-  }, [])
+  const createTask = async (taskData: Omit<Task, 'id' | 'created_at' | 'updated_at'>) => {
+    try {
+      await createTaskApi(taskData)
+      toast.success('Тапсырма құрылды!')
+      // Real-time обновит список автоматически
+    } catch (err) {
+      toast.error('Тапсырма құру сәтсіз')
+      throw err
+    }
+  }
 
-  const createTeam = useCallback(async (name: string, description: string) => {
-    const { data: userData } = await supabase.auth.getUser()
-    if (!userData.user) throw new Error('Not authenticated')
+  const updateTaskStatus = async (id: string, status: TaskStatus) => {
+    try {
+      await updateTaskApi(id, { status })
+      // Real-time обновит список автоматически
+    } catch (err) {
+      toast.error('Мәртебені өзгерту сәтсіз')
+    }
+  }
 
-    const { data: team, error } = await supabase
-      .from('teams')
-      .insert({ name, description, owner_id: userData.user.id })
-      .select()
-      .single()
+  const editTask = async (updated: Task) => {
+    try {
+      await updateTaskApi(updated.id, updated)
+      toast.success('Тапсырма жаңартылды!')
+      // Real-time обновит список автоматически
+    } catch (err) {
+      toast.error('Жаңарту сәтсіз')
+    }
+  }
 
-    if (error) throw error
+  const removeTask = async (id: string) => {
+    try {
+      await deleteTaskApi(id)
+      toast.success('Тапсырма өшірілді!')
+      // Real-time обновит список автоматически
+    } catch (err) {
+      toast.error('Өшіру сәтсіз')
+    }
+  }
 
-    await supabase.from('team_members').insert({
-      team_id: team.id,
-      user_id: userData.user.id,
-      role: 'owner'
-    })
+  const createTeam = async (name: string, description: string): Promise<TeamWithMembers | null> => {
+    try {
+      const team = await createTeamApi(name, description)
+      await refreshTeams()
+      if (team) {
+        localStorage.setItem('taskflow-active-team-id', team.id)
+      }
+      toast.success('Команда құрылды!')
+      return team as TeamWithMembers
+    } catch (err) {
+      toast.error('Команда құру сәтсіз')
+      return null
+    }
+  }
 
-    setTeams(prev => [...prev, team])
-  }, [])
+  const joinTeam = async (inviteCode: string): Promise<boolean> => {
+    try {
+      const team = await joinTeamByCode(inviteCode)
+      if (team) {
+        await refreshTeams()
+        toast.success(`"${team.name}" командасына қосылдыңыз!`)
+        return true
+      }
+      toast.error('Қате шақыру коды немесе сіз бұл командадасыз')
+      return false
+    } catch (err) {
+      toast.error('Қосылу сәтсіз')
+      return false
+    }
+  }
 
-  const joinTeam = useCallback(async (inviteCode: string) => {
-    const { data: userData } = await supabase.auth.getUser()
-    if (!userData.user) throw new Error('Not authenticated')
+  const getTeamTasks = (teamId: string) => {
+    return tasks.filter((t) => t.team_id === teamId)
+  }
 
-    const { data: team } = await supabase
-      .from('teams')
-      .select('*')
-      .eq('invite_code', inviteCode)
-      .single()
+  const getUserTeamsList = () => teams
 
-    if (!team) throw new Error('Invalid invite code')
+  const unreadCount = notifications.filter((n) => !n.read).length
 
-    const { error } = await supabase.from('team_members').insert({
-      team_id: team.id,
-      user_id: userData.user.id,
-      role: 'member'
-    })
-
-    if (error) throw error
-    
-    setTeams(prev => [...prev, team])
-  }, [])
-
-  const markNotificationRead = useCallback(async (id: string) => {
-    await supabase.from('notifications').update({ read: true }).eq('id', id)
-    setNotifications(prev => prev.filter(n => n.id !== id))
-  }, [])
+  const markNotifRead = async (id: string) => {
+    try {
+      await markNotificationAsRead(id)
+      await refreshNotifications()
+    } catch (err) {
+      console.error('Failed to mark notification as read:', err)
+    }
+  }
 
   return (
-    <TaskContext.Provider value={{
-      tasks,
-      teams,
-      notifications,
-      selectedTeamId,
-      loading,
-      setSelectedTeamId,
-      createTask,
-      updateTask,
-      deleteTask,
-      refreshTasks,
-      createTeam,
-      joinTeam,
-      markNotificationRead
-    }}>
+    <TaskContext.Provider
+      value={{
+        tasks,
+        teams,
+        notifications,
+        activeTeamId,
+        setActiveTeamId,
+        createTask,
+        updateTaskStatus,
+        editTask,
+        removeTask,
+        createTeam,
+        joinTeam,
+        getTeamTasks,
+        getUserTeamsList,
+        unreadCount,
+        markNotifRead,
+        refreshTasks,
+        refreshTeams,
+        refreshNotifications,
+        loading,
+      }}
+    >
       {children}
     </TaskContext.Provider>
   )
 }
 
-export function useTaskContext() {
-  const ctx = useContext(TaskContext)
-  if (!ctx) throw new Error('useTaskContext must be used within TaskProvider')
-  return ctx
+export function useTask() {
+  const context = useContext(TaskContext)
+  if (!context) {
+    throw new Error('useTask must be used within TaskProvider')
+  }
+  return context
 }
