@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, type ReactNode } from 'react'
+import { createContext, useContext, useState, useEffect, useRef, type ReactNode } from 'react'
 import type { Task, TaskStatus, TeamWithMembers, Notification } from '@/types'
 import { useAuth } from './AuthContext'
 import {
@@ -47,6 +47,8 @@ export function TaskProvider({ children }: { children: ReactNode }) {
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [loading, setLoading] = useState(false)
   const [activeTeamId, setActiveTeamId] = useState<string>('')
+  // AbortController for cancelling pending task requests
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   // Load teams on mount
   useEffect(() => {
@@ -136,9 +138,28 @@ export function TaskProvider({ children }: { children: ReactNode }) {
 
   const refreshTasks = async (teamId: string) => {
     if (!teamId) return
+    
+    // Cancel previous request if it exists
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    
+    // Create new abort controller for this request
+    abortControllerRef.current = new AbortController()
+    
     setActiveTeamId(teamId)
-    const data = await getTasks(teamId)
-    setTasks(data)
+    setTasks([]) // Clear old tasks before loading new ones
+    setLoading(true)
+    
+    try {
+      const data = await getTasks(teamId)
+      // Only update if request wasn't aborted
+      if (!abortControllerRef.current?.signal.aborted) {
+        setTasks(data)
+      }
+    } finally {
+      setLoading(false)
+    }
   }
 
   const refreshTeams = async () => {
